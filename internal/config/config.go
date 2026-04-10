@@ -65,6 +65,7 @@ var SyncPaths = []string{
 	"tasks",
 	"history.jsonl",
 	"rules",
+	"statusline.sh",
 }
 
 func ConfigDirPath() string {
