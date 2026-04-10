@@ -1,0 +1,122 @@
+name: Sync upstream
+
+on:
+  schedule:
+    # 每天北京时间 06:00 (UTC 22:00 前一日)
+    - cron: "0 22 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_URL: https://github.com/tawanorg/claude-sync.git
+      UPSTREAM_BRANCH: main
+      PATCHES_BRANCH: patches
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PATCHES_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name  "sync-bot"
+          git config user.email "sync-bot@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch upstream "$UPSTREAM_BRANCH" --tags
+
+      - name: Fast-forward main from upstream
+        run: |
+          git checkout -B main upstream/$UPSTREAM_BRANCH
+          git push origin main --tags --force-with-lease
+
+      - name: Rebase patches onto upstream
+        id: rebase
+        run: |
+          git checkout "$PATCHES_BRANCH"
+          if git rebase upstream/$UPSTREAM_BRANCH; then
+            echo "status=ok" >> "$GITHUB_OUTPUT"
+          else
+            git rebase --abort || true
+            echo "status=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Go
+        if: steps.rebase.outputs.status == 'ok'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build & test
+        if: steps.rebase.outputs.status == 'ok'
+        id: build
+        continue-on-error: true
+        run: |
+          go build ./...
+          go test ./... -count=1
+
+      - name: Push rebased patches
+        if: steps.rebase.outputs.status == 'ok' && steps.build.outcome == 'success'
+        run: |
+          # 判断是否真的有更新
+          if [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/$PATCHES_BRANCH)" ]; then
+            echo "Nothing to push"
+            exit 0
+          fi
+          git push origin "$PATCHES_BRANCH" --force-with-lease
+
+      - name: Report failure
+        if: steps.rebase.outputs.status == 'conflict' || steps.build.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const rebase = '${{ steps.rebase.outputs.status }}';
+            const build  = '${{ steps.build.outcome }}';
+            const title  = 'Upstream sync failed';
+            const body = [
+              'Automatic upstream sync encountered a problem.',
+              '',
+              `- Rebase status: \`${rebase}\``,
+              `- Build status:  \`${build}\``,
+              '',
+              'Resolve locally:',
+              '',
+              '```bash',
+              'jj git fetch',
+              'jj rebase -d main@origin -s patches',
+              'jj resolve     # 如果出现冲突',
+              'jj git push -b patches',
+              '```',
+            ].join('\n');
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              state: 'open',
+              labels: 'sync-conflict',
+            });
+            if (issues.length === 0) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                title, body,
+                labels: ['sync-conflict'],
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                issue_number: issues[0].number,
+                body,
+              });
+            }
+            core.setFailed('sync failed');
