@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/AlecAivazis/survey/v2"
+	"github.com/pmezard/go-difflib/difflib"
 	"github.com/spf13/cobra"
 
 	"github.com/tawanorg/claude-sync/internal/config"
@@ -990,10 +991,14 @@ Examples:
 }
 
 func statusCmd() *cobra.Command {
-	return &cobra.Command{
+	var showDiff bool
+	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Show pending local changes",
-		Long:  `Display files that have been added, modified, or deleted locally.`,
+		Long: `Display files that have been added, modified, or deleted locally.
+
+Use --diff / -p to also print a unified content diff against the last pushed
+(remote) baseline for each changed file.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.Load()
 			if err != nil {
@@ -1054,6 +1059,12 @@ func statusCmd() *cobra.Command {
 				fmt.Println()
 			}
 
+			if showDiff {
+				if err := printStatusDiffs(ctx, syncer, added, modified, deleted); err != nil {
+					return err
+				}
+			}
+
 			state := syncer.GetState()
 			if !state.LastPush.IsZero() {
 				fmt.Printf("Last push: %s\n", state.LastPush.Format(time.RFC3339))
@@ -1065,6 +1076,116 @@ func statusCmd() *cobra.Command {
 			return nil
 		},
 	}
+	cmd.Flags().BoolVarP(&showDiff, "diff", "p", false, "Show unified content diff against the remote baseline")
+	return cmd
+}
+
+// printStatusDiffs prints a unified diff for each pending change against the
+// last pushed (remote) baseline. Added files show their full new content;
+// deleted files show the remote content that would be removed; modified files
+// show a unified diff.
+func printStatusDiffs(ctx context.Context, syncer *sync.Syncer, added, modified, deleted []sync.FileChange) error {
+	claudeDir := config.ClaudeDir()
+
+	printHeader := func(marker, path string) {
+		fmt.Printf("\n%sdiff %s%s\n", colorBold, path, colorReset)
+		fmt.Printf("%s%s%s\n", colorBold, marker, colorReset)
+	}
+
+	for _, c := range added {
+		printHeader("--- /dev/null\n+++ "+c.Path, c.Path)
+		local, err := os.ReadFile(filepath.Join(claudeDir, c.Path))
+		if err != nil {
+			fmt.Printf("  (failed to read local: %v)\n", err)
+			continue
+		}
+		if !isTextContent(local) {
+			fmt.Printf("  (binary file, %s)\n", util.FormatSize(int64(len(local))))
+			continue
+		}
+		for _, line := range strings.Split(strings.TrimRight(string(local), "\n"), "\n") {
+			fmt.Printf("+%s\n", line)
+		}
+	}
+
+	for _, c := range modified {
+		printHeader("--- remote/"+c.Path+"\n+++ local/"+c.Path, c.Path)
+		remote, err := syncer.FetchRemoteContent(ctx, c.Path)
+		if err != nil {
+			// Fallback: treat like an add if remote doesn't have it yet.
+			fmt.Printf("  (remote unavailable: %v)\n", err)
+			continue
+		}
+		local, err := os.ReadFile(filepath.Join(claudeDir, c.Path))
+		if err != nil {
+			fmt.Printf("  (failed to read local: %v)\n", err)
+			continue
+		}
+		if !isTextContent(remote) || !isTextContent(local) {
+			fmt.Printf("  (binary file, remote=%s local=%s)\n",
+				util.FormatSize(int64(len(remote))),
+				util.FormatSize(int64(len(local))))
+			continue
+		}
+		diff := difflib.UnifiedDiff{
+			A:        difflib.SplitLines(string(remote)),
+			B:        difflib.SplitLines(string(local)),
+			FromFile: "remote/" + c.Path,
+			ToFile:   "local/" + c.Path,
+			Context:  3,
+		}
+		text, err := difflib.GetUnifiedDiffString(diff)
+		if err != nil {
+			fmt.Printf("  (diff failed: %v)\n", err)
+			continue
+		}
+		// UnifiedDiff already emits --- / +++ headers; skip the ones we printed.
+		fmt.Print(stripUnifiedHeader(text))
+	}
+
+	for _, c := range deleted {
+		printHeader("--- remote/"+c.Path+"\n+++ /dev/null", c.Path)
+		remote, err := syncer.FetchRemoteContent(ctx, c.Path)
+		if err != nil {
+			fmt.Printf("  (remote unavailable: %v)\n", err)
+			continue
+		}
+		if !isTextContent(remote) {
+			fmt.Printf("  (binary file, %s)\n", util.FormatSize(int64(len(remote))))
+			continue
+		}
+		for _, line := range strings.Split(strings.TrimRight(string(remote), "\n"), "\n") {
+			fmt.Printf("-%s\n", line)
+		}
+	}
+
+	return nil
+}
+
+// isTextContent returns true if buf looks like UTF-8 text (no NUL bytes in the
+// first 8KiB sniffed). Keeps diff output readable and avoids dumping binaries.
+func isTextContent(buf []byte) bool {
+	n := len(buf)
+	if n > 8192 {
+		n = 8192
+	}
+	for i := 0; i < n; i++ {
+		if buf[i] == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// stripUnifiedHeader drops the leading "--- ... / +++ ..." lines produced by
+// difflib since printStatusDiffs already printed its own header.
+func stripUnifiedHeader(s string) string {
+	for i := 0; i < 2; i++ {
+		if idx := strings.IndexByte(s, '\n'); idx >= 0 {
+			s = s[idx+1:]
+		}
+	}
+	return s
 }
 
 func diffCmd() *cobra.Command {

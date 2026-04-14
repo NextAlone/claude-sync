@@ -404,24 +404,9 @@ func (s *Syncer) uploadFile(ctx context.Context, relativePath string) error {
 }
 
 func (s *Syncer) downloadFile(ctx context.Context, relativePath, remoteKey string) error {
-	// Download
-	encrypted, err := s.storage.Download(ctx, remoteKey)
+	data, err := s.fetchByRemoteKey(ctx, remoteKey)
 	if err != nil {
-		return fmt.Errorf("failed to download: %w", err)
-	}
-
-	// Decrypt
-	data, err := s.encryptor.Decrypt(encrypted)
-	if err != nil {
-		return fmt.Errorf("failed to decrypt: %w", err)
-	}
-
-	// Decompress if gzipped (backward-compatible with uncompressed data)
-	if isGzipped(data) {
-		data, err = gzipDecompress(data)
-		if err != nil {
-			return fmt.Errorf("failed to decompress: %w", err)
-		}
+		return err
 	}
 
 	// Ensure directory exists
@@ -460,6 +445,33 @@ func (s *Syncer) handleConflict(ctx context.Context, relativePath string, remote
 func (s *Syncer) remoteKey(relativePath string) string {
 	// Add .age extension for encrypted files
 	return relativePath + ".age"
+}
+
+// FetchRemoteContent downloads, decrypts and decompresses a remote file
+// without writing it to disk. Returns the plaintext bytes.
+func (s *Syncer) FetchRemoteContent(ctx context.Context, relativePath string) ([]byte, error) {
+	return s.fetchByRemoteKey(ctx, s.remoteKey(relativePath))
+}
+
+func (s *Syncer) fetchByRemoteKey(ctx context.Context, remoteKey string) ([]byte, error) {
+	encrypted, err := s.storage.Download(ctx, remoteKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to download: %w", err)
+	}
+
+	data, err := s.encryptor.Decrypt(encrypted)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt: %w", err)
+	}
+
+	if isGzipped(data) {
+		data, err = gzipDecompress(data)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decompress: %w", err)
+		}
+	}
+
+	return data, nil
 }
 
 func (s *Syncer) localPath(remoteKey string) string {
