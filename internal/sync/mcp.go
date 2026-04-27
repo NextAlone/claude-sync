@@ -23,11 +23,19 @@ type MCPMergeResult struct {
 	Conflicts []MCPConflict
 }
 
+// FieldConflict represents a conflict at a specific field path within a server config.
+type FieldConflict struct {
+	Path   string // Field path, e.g., "args[0]" or "env.FOO"
+	Local  any
+	Remote any
+}
+
 // MCPConflict represents a merge conflict for a single MCP server key.
 type MCPConflict struct {
-	Key    string
-	Local  json.RawMessage
-	Remote json.RawMessage
+	Key            string
+	Local          json.RawMessage
+	Remote         json.RawMessage
+	FieldConflicts []FieldConflict // Field-level conflicts within the server config
 }
 
 // MCPPushResult describes the outcome of pushing MCP configs.
@@ -171,17 +179,325 @@ func ResolveMCPServers(servers MCPServers, homeDir string) (MCPServers, error) {
 	return result, nil
 }
 
+// canonicalJSON returns a canonical (sorted keys) JSON representation.
+func canonicalJSON(data []byte) ([]byte, error) {
+	var v any
+	if err := json.Unmarshal(data, &v); err != nil {
+		return nil, err
+	}
+	return json.Marshal(v)
+}
+
 // mcpServerEqual compares two server configs by their canonical JSON representation.
+// Key order is ignored - {"a":1,"b":2} equals {"b":2,"a":1}.
 func mcpServerEqual(a, b json.RawMessage) bool {
-	// Compact both to canonical form for comparison
-	var aBuf, bBuf bytes.Buffer
-	if err := json.Compact(&aBuf, a); err != nil {
+	aCanon, err := canonicalJSON(a)
+	if err != nil {
 		return false
 	}
-	if err := json.Compact(&bBuf, b); err != nil {
+	bCanon, err := canonicalJSON(b)
+	if err != nil {
 		return false
 	}
-	return bytes.Equal(aBuf.Bytes(), bBuf.Bytes())
+	return bytes.Equal(aCanon, bCanon)
+}
+
+// jsonEqual compares two arbitrary JSON values for equality.
+// Key order is ignored for objects.
+func jsonEqual(a, b any) bool {
+	aJSON, err := json.Marshal(a)
+	if err != nil {
+		return false
+	}
+	bJSON, err := json.Marshal(b)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(aJSON, bJSON)
+}
+
+// serverMergeResult holds the result of merging a single server's config.
+type serverMergeResult struct {
+	merged    map[string]any
+	conflicts []FieldConflict
+	changed   bool // true if merged differs from local
+}
+
+// mergeServerConfigs performs field-level three-way merge of server configurations.
+func mergeServerConfigs(local, remote, baseline json.RawMessage) serverMergeResult {
+	var localMap, remoteMap, baselineMap map[string]any
+
+	if err := json.Unmarshal(local, &localMap); err != nil {
+		localMap = make(map[string]any)
+	}
+	if err := json.Unmarshal(remote, &remoteMap); err != nil {
+		remoteMap = make(map[string]any)
+	}
+	if baseline != nil {
+		if err := json.Unmarshal(baseline, &baselineMap); err != nil {
+			baselineMap = make(map[string]any)
+		}
+	} else {
+		baselineMap = make(map[string]any)
+	}
+
+	merged, conflicts := mergeObjects(localMap, remoteMap, baselineMap, "")
+	changed := !jsonEqual(merged, localMap)
+
+	return serverMergeResult{
+		merged:    merged,
+		conflicts: conflicts,
+		changed:   changed,
+	}
+}
+
+// mergeObjects recursively merges two maps with a baseline reference.
+func mergeObjects(local, remote, baseline map[string]any, pathPrefix string) (map[string]any, []FieldConflict) {
+	result := make(map[string]any)
+	var conflicts []FieldConflict
+
+	allKeys := make(map[string]bool)
+	for k := range local {
+		allKeys[k] = true
+	}
+	for k := range remote {
+		allKeys[k] = true
+	}
+	for k := range baseline {
+		allKeys[k] = true
+	}
+
+	for key := range allKeys {
+		path := key
+		if pathPrefix != "" {
+			path = pathPrefix + "." + key
+		}
+
+		l, inLocal := local[key]
+		r, inRemote := remote[key]
+		b, inBaseline := baseline[key]
+
+		switch {
+		case !inLocal && inRemote && !inBaseline:
+			result[key] = r
+
+		case inLocal && !inRemote && !inBaseline:
+			result[key] = l
+
+		case inLocal && inRemote && inBaseline:
+			localChanged := !jsonEqual(l, b)
+			remoteChanged := !jsonEqual(r, b)
+
+			switch {
+			case !localChanged && !remoteChanged:
+				result[key] = l
+			case !localChanged && remoteChanged:
+				result[key] = r
+			case localChanged && !remoteChanged:
+				result[key] = l
+			default:
+				if jsonEqual(l, r) {
+					result[key] = l
+				} else {
+					merged, fieldConflicts := mergeValue(l, r, b, path)
+					result[key] = merged
+					conflicts = append(conflicts, fieldConflicts...)
+				}
+			}
+
+		case inLocal && inRemote && !inBaseline:
+			if jsonEqual(l, r) {
+				result[key] = l
+			} else {
+				merged, fieldConflicts := mergeValue(l, r, nil, path)
+				result[key] = merged
+				conflicts = append(conflicts, fieldConflicts...)
+			}
+
+		case !inLocal && inRemote && inBaseline:
+			if jsonEqual(r, b) {
+				// local deleted, remote unchanged -> honor deletion
+			} else {
+				conflicts = append(conflicts, FieldConflict{Path: path, Remote: r})
+			}
+
+		case inLocal && !inRemote && inBaseline:
+			if jsonEqual(l, b) {
+				// remote deleted, local unchanged -> honor deletion
+			} else {
+				result[key] = l
+				conflicts = append(conflicts, FieldConflict{Path: path, Local: l})
+			}
+
+		case !inLocal && !inRemote && inBaseline:
+			// both deleted
+
+		default:
+			if inRemote {
+				result[key] = r
+			} else if inLocal {
+				result[key] = l
+			}
+		}
+	}
+
+	return result, conflicts
+}
+
+// mergeValue attempts to merge two values, recursing into objects/arrays if possible.
+func mergeValue(local, remote, baseline any, path string) (any, []FieldConflict) {
+	localMap, localIsMap := local.(map[string]any)
+	remoteMap, remoteIsMap := remote.(map[string]any)
+	baselineMap, baselineIsMap := baseline.(map[string]any)
+
+	if localIsMap && remoteIsMap {
+		if !baselineIsMap {
+			baselineMap = make(map[string]any)
+		}
+		return mergeObjects(localMap, remoteMap, baselineMap, path)
+	}
+
+	localArr, localIsArr := local.([]any)
+	remoteArr, remoteIsArr := remote.([]any)
+
+	if localIsArr && remoteIsArr {
+		merged, conflicts := mergeArrays(localArr, remoteArr, baseline, path)
+		return merged, conflicts
+	}
+
+	return local, []FieldConflict{{Path: path, Local: local, Remote: remote}}
+}
+
+// mergeArrays merges two arrays using three-way logic.
+// For arrays with object elements that have identifiable keys, uses set semantics.
+// For simple value arrays (strings, numbers), treats as ordered lists - conflict if both changed.
+func mergeArrays(local, remote []any, baseline any, path string) ([]any, []FieldConflict) {
+	baselineArr, hasBaseline := baseline.([]any)
+
+	// Check if arrays contain objects (set semantics) or primitives (ordered list semantics)
+	hasObjects := false
+	for _, v := range local {
+		if _, ok := v.(map[string]any); ok {
+			hasObjects = true
+			break
+		}
+	}
+	if !hasObjects {
+		for _, v := range remote {
+			if _, ok := v.(map[string]any); ok {
+				hasObjects = true
+				break
+			}
+		}
+	}
+
+	// For primitive arrays (like args), use ordered list semantics
+	if !hasObjects {
+		localKey := jsonKey(local)
+		remoteKey := jsonKey(remote)
+
+		if localKey == remoteKey {
+			return local, nil
+		}
+
+		if hasBaseline {
+			baselineKey := jsonKey(baselineArr)
+			localChanged := localKey != baselineKey
+			remoteChanged := remoteKey != baselineKey
+
+			switch {
+			case !localChanged && !remoteChanged:
+				return local, nil
+			case !localChanged && remoteChanged:
+				return remote, nil
+			case localChanged && !remoteChanged:
+				return local, nil
+			default:
+				// Both changed differently - conflict
+				return local, []FieldConflict{{Path: path, Local: local, Remote: remote}}
+			}
+		}
+
+		// No baseline, different values - conflict
+		return local, []FieldConflict{{Path: path, Local: local, Remote: remote}}
+	}
+
+	// For object arrays, use set semantics with identifier detection
+	localSet := make(map[string]any)
+	remoteSet := make(map[string]any)
+	baselineSet := make(map[string]any)
+
+	for _, v := range local {
+		key := objectIdentifier(v)
+		localSet[key] = v
+	}
+	for _, v := range remote {
+		key := objectIdentifier(v)
+		remoteSet[key] = v
+	}
+	for _, v := range baselineArr {
+		key := objectIdentifier(v)
+		baselineSet[key] = v
+	}
+
+	var result []any
+	seen := make(map[string]bool)
+
+	for _, v := range local {
+		key := objectIdentifier(v)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+
+		_, inRemote := remoteSet[key]
+		_, inBaseline := baselineSet[key]
+
+		if !inRemote && inBaseline {
+			continue
+		}
+		result = append(result, v)
+	}
+
+	for _, v := range remote {
+		key := objectIdentifier(v)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+
+		_, inLocal := localSet[key]
+		_, inBaseline := baselineSet[key]
+
+		if !inLocal && inBaseline {
+			continue
+		}
+		result = append(result, v)
+	}
+
+	return result, nil
+}
+
+// objectIdentifier returns a stable identifier for an object.
+// Tries common identifier fields, falls back to full JSON.
+func objectIdentifier(v any) string {
+	if m, ok := v.(map[string]any); ok {
+		// Try common identifier fields
+		for _, key := range []string{"name", "id", "command", "matcher"} {
+			if id, exists := m[key]; exists {
+				if s, ok := id.(string); ok && s != "" {
+					return key + ":" + s
+				}
+			}
+		}
+	}
+	return jsonKey(v)
+}
+
+// jsonKey returns a canonical string key for a JSON value (for set operations).
+func jsonKey(v any) string {
+	data, _ := json.Marshal(v)
+	return string(data)
 }
 
 // MergeMCPServers performs a three-way merge of MCP server configurations.
@@ -238,19 +554,28 @@ func MergeMCPServers(local, remote, baseline MCPServers) *MCPMergeResult {
 				result.Merged[key] = l
 				result.Kept = append(result.Kept, key)
 			default:
-				// Both changed
+				// Both changed - attempt field-level merge
 				if mcpServerEqual(l, r) {
-					// Changed identically
 					result.Merged[key] = l
 					result.Kept = append(result.Kept, key)
 				} else {
-					// Conflict: keep local, report conflict
-					result.Merged[key] = l
-					result.Conflicts = append(result.Conflicts, MCPConflict{
-						Key:    key,
-						Local:  l,
-						Remote: r,
-					})
+					mergeRes := mergeServerConfigs(l, r, b)
+					mergedJSON, _ := json.Marshal(mergeRes.merged)
+					result.Merged[key] = mergedJSON
+
+					if len(mergeRes.conflicts) > 0 {
+						result.Conflicts = append(result.Conflicts, MCPConflict{
+							Key:            key,
+							Local:          l,
+							Remote:         r,
+							FieldConflicts: mergeRes.conflicts,
+						})
+					}
+					if mergeRes.changed {
+						result.Updated = append(result.Updated, key)
+					} else {
+						result.Kept = append(result.Kept, key)
+					}
 				}
 			}
 
@@ -260,13 +585,24 @@ func MergeMCPServers(local, remote, baseline MCPServers) *MCPMergeResult {
 				result.Merged[key] = l
 				result.Kept = append(result.Kept, key)
 			} else {
-				// Conflict: keep local, report
-				result.Merged[key] = l
-				result.Conflicts = append(result.Conflicts, MCPConflict{
-					Key:    key,
-					Local:  l,
-					Remote: r,
-				})
+				// Field-level merge without baseline
+				mergeRes := mergeServerConfigs(l, r, nil)
+				mergedJSON, _ := json.Marshal(mergeRes.merged)
+				result.Merged[key] = mergedJSON
+
+				if len(mergeRes.conflicts) > 0 {
+					result.Conflicts = append(result.Conflicts, MCPConflict{
+						Key:            key,
+						Local:          l,
+						Remote:         r,
+						FieldConflicts: mergeRes.conflicts,
+					})
+				}
+				if mergeRes.changed {
+					result.Updated = append(result.Updated, key)
+				} else {
+					result.Kept = append(result.Kept, key)
+				}
 			}
 
 		// In baseline and remote, deleted locally
