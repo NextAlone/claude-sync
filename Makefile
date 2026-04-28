@@ -14,6 +14,7 @@ all: build
 # Build the binary
 build:
 	$(GO) build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) ./cmd/claude-sync
+	ln -sf $(BINARY_NAME) $(BUILD_DIR)/codex-sync
 
 # Install to GOPATH/bin
 install:
@@ -41,10 +42,14 @@ build-all: build-darwin build-linux
 build-darwin:
 	GOOS=darwin GOARCH=arm64 $(GO) build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-darwin-arm64 ./cmd/claude-sync
 	GOOS=darwin GOARCH=amd64 $(GO) build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-darwin-amd64 ./cmd/claude-sync
+	ln -sf $(BINARY_NAME)-darwin-arm64 $(BUILD_DIR)/codex-sync-darwin-arm64
+	ln -sf $(BINARY_NAME)-darwin-amd64 $(BUILD_DIR)/codex-sync-darwin-amd64
 
 build-linux:
 	GOOS=linux GOARCH=amd64 $(GO) build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-linux-amd64 ./cmd/claude-sync
 	GOOS=linux GOARCH=arm64 $(GO) build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-linux-arm64 ./cmd/claude-sync
+	ln -sf $(BINARY_NAME)-linux-amd64 $(BUILD_DIR)/codex-sync-linux-amd64
+	ln -sf $(BINARY_NAME)-linux-arm64 $(BUILD_DIR)/codex-sync-linux-arm64
 
 # Development: build and run
 run: build

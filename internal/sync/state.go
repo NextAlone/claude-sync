@@ -186,6 +186,11 @@ func HashFile(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+func HashBytes(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
 func GetLocalFiles(claudeDir string, syncPaths []string, excludeFn ...func(string) bool) (map[string]os.FileInfo, error) {
 	files := make(map[string]os.FileInfo)
 
@@ -263,6 +268,10 @@ type FileChange struct {
 }
 
 func (s *SyncState) DetectChanges(claudeDir string, syncPaths []string, excludeFn ...func(string) bool) ([]FileChange, error) {
+	return s.DetectChangesWithHash(claudeDir, syncPaths, nil, excludeFn...)
+}
+
+func (s *SyncState) DetectChangesWithHash(claudeDir string, syncPaths []string, hashFn func(string) (string, error), excludeFn ...func(string) bool) ([]FileChange, error) {
 	var changes []FileChange
 
 	localFiles, err := GetLocalFiles(claudeDir, syncPaths, excludeFn...)
@@ -273,7 +282,12 @@ func (s *SyncState) DetectChanges(claudeDir string, syncPaths []string, excludeF
 	// Check for new or modified files
 	for relPath, info := range localFiles {
 		fullPath := filepath.Join(claudeDir, relPath)
-		hash, err := HashFile(fullPath)
+		var hash string
+		if hashFn != nil {
+			hash, err = hashFn(relPath)
+		} else {
+			hash, err = HashFile(fullPath)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("failed to hash %s: %w", relPath, err)
 		}

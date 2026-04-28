@@ -32,8 +32,10 @@ import (
 )
 
 var (
-	version = "dev" // Set via ldflags at build time: -ldflags "-X main.version=x.x.x"
-	quiet   bool
+	version   = "dev" // Set via ldflags at build time: -ldflags "-X main.version=x.x.x"
+	quiet     bool
+	configDir string
+	aliasApp  string
 )
 
 // ANSI color codes
@@ -47,14 +49,35 @@ const (
 )
 
 func main() {
+	binaryName := filepath.Base(os.Args[0])
+	defaultConfigDir := "~/.claude-sync"
+	use := "claude-sync"
+	short := "Sync Claude Code sessions across devices"
+	long := `A CLI tool to sync your ~/.claude directory across devices using cloud storage with encryption.`
+	if binaryName == "codex-sync" {
+		defaultConfigDir = "~/.codex-sync"
+		use = "codex-sync"
+		short = "Sync Codex configuration across devices"
+		long = `A CLI tool to sync your ~/.codex directory across devices using cloud storage with encryption.`
+		aliasApp = "codex"
+	}
+
 	rootCmd := &cobra.Command{
-		Use:     "claude-sync",
-		Short:   "Sync Claude Code sessions across devices",
-		Long:    `A CLI tool to sync your ~/.claude directory across devices using cloud storage with encryption.`,
+		Use:     use,
+		Short:   short,
+		Long:    long,
 		Version: version,
 	}
 
 	rootCmd.PersistentFlags().BoolVarP(&quiet, "quiet", "q", false, "Suppress output")
+	rootCmd.PersistentFlags().StringVar(&configDir, "config-dir", "", "Config directory (default: "+defaultConfigDir+" or CLAUDE_SYNC_CONFIG_DIR)")
+	cobra.OnInitialize(func() {
+		if configDir != "" {
+			os.Setenv("CLAUDE_SYNC_CONFIG_DIR", configDir)
+		} else if os.Getenv("CLAUDE_SYNC_CONFIG_DIR") == "" && binaryName == "codex-sync" {
+			os.Setenv("CLAUDE_SYNC_CONFIG_DIR", defaultConfigDir)
+		}
+	})
 
 	rootCmd.AddCommand(
 		initCmd(),
@@ -113,6 +136,7 @@ func printWarning(text string) {
 func initCmd() *cobra.Command {
 	var provider, bucket string
 	var usePassphrase, force bool
+	var appName, sourceDir, stateDir, remotePrefix string
 
 	// R2 flags
 	var accountID, accessKey, secretKey string
@@ -143,6 +167,9 @@ Examples:
 
 			ctx := context.Background()
 			keyPath := config.AgeKeyFilePath()
+			if appName == "" {
+				appName = aliasApp
+			}
 
 			// Special case: --passphrase with existing config = just regenerate key
 			if usePassphrase && config.Exists() && !force {
@@ -150,7 +177,7 @@ Examples:
 			}
 
 			// Normal flow: full setup
-			return initFullSetup(ctx, keyPath, provider, bucket, accountID, accessKey, secretKey, s3Region, gcsProjectID, gcsCredentialsFile, usePassphrase, force)
+			return initFullSetup(ctx, keyPath, provider, bucket, accountID, accessKey, secretKey, s3Region, gcsProjectID, gcsCredentialsFile, appName, sourceDir, stateDir, remotePrefix, usePassphrase, force)
 		},
 	}
 
@@ -159,6 +186,10 @@ Examples:
 	cmd.Flags().StringVar(&bucket, "bucket", "", "Bucket name")
 	cmd.Flags().BoolVar(&usePassphrase, "passphrase", false, "Derive encryption key from passphrase")
 	cmd.Flags().BoolVarP(&force, "force", "f", false, "Overwrite existing config/key without prompting")
+	cmd.Flags().StringVar(&appName, "app", "", "Application profile: claude or codex")
+	cmd.Flags().StringVar(&sourceDir, "source-dir", "", "Local source directory to sync")
+	cmd.Flags().StringVar(&stateDir, "state-dir", "", "Directory for sync state")
+	cmd.Flags().StringVar(&remotePrefix, "remote-prefix", "", "Remote object prefix, e.g. codex/")
 
 	// R2 flags
 	cmd.Flags().StringVar(&accountID, "account-id", "", "Cloudflare Account ID (R2)")
@@ -217,7 +248,7 @@ func initPassphraseOnly(ctx context.Context, keyPath string) error {
 }
 
 // initFullSetup handles the full init wizard
-func initFullSetup(ctx context.Context, keyPath, provider, bucket, accountID, accessKey, secretKey, s3Region, gcsProjectID, gcsCredentialsFile string, usePassphrase, force bool) error {
+func initFullSetup(ctx context.Context, keyPath, provider, bucket, accountID, accessKey, secretKey, s3Region, gcsProjectID, gcsCredentialsFile, appName, sourceDir, stateDir, remotePrefix string, usePassphrase, force bool) error {
 	if config.Exists() && !force {
 		var overwrite bool
 		prompt := &survey.Confirm{
@@ -397,8 +428,9 @@ skipKeyGen:
 	// Save config
 	cfg := &config.Config{
 		Storage:       storageCfg,
-		EncryptionKey: "~/.claude-sync/age-key.txt",
+		EncryptionKey: keyPath,
 	}
+	applyAppProfile(cfg, appName, sourceDir, stateDir, remotePrefix)
 
 	if err := config.Save(cfg); err != nil {
 		return err
@@ -413,6 +445,34 @@ skipKeyGen:
 	fmt.Println()
 
 	return nil
+}
+
+func applyAppProfile(cfg *config.Config, appName, sourceDir, stateDir, remotePrefix string) {
+	switch strings.ToLower(strings.TrimSpace(appName)) {
+	case "codex":
+		cfg.AppName = "Codex"
+		cfg.SourceDir = "~/.codex"
+		cfg.StateDir = "~/.codex-sync"
+		cfg.RemotePrefix = "codex/"
+		cfg.SyncPaths = append([]string(nil), config.CodexSyncPaths...)
+		cfg.Exclude = append([]string(nil), config.CodexExclude...)
+	case "claude", "":
+		if appName != "" {
+			cfg.AppName = "Claude"
+		}
+	default:
+		cfg.AppName = appName
+	}
+
+	if sourceDir != "" {
+		cfg.SourceDir = sourceDir
+	}
+	if stateDir != "" {
+		cfg.StateDir = stateDir
+	}
+	if remotePrefix != "" {
+		cfg.RemotePrefix = config.NormalizeRemotePrefix(remotePrefix)
+	}
 }
 
 // enterPassphraseAndVerify prompts for passphrase and verifies against remote
@@ -879,7 +939,7 @@ Examples:
 
 			// Check for first pull with existing local files
 			if !syncer.HasState() {
-				hasExisting, err := hasExistingClaudeFiles()
+				hasExisting, err := hasExistingClaudeFiles(syncer)
 				if err != nil {
 					return err
 				}
@@ -1085,7 +1145,7 @@ Use --diff / -p to also print a unified content diff against the last pushed
 // deleted files show the remote content that would be removed; modified files
 // show a unified diff.
 func printStatusDiffs(ctx context.Context, syncer *sync.Syncer, added, modified, deleted []sync.FileChange) error {
-	claudeDir := config.ClaudeDir()
+	claudeDir := syncer.LocalDir()
 
 	printHeader := func(marker, path string) {
 		fmt.Printf("\n%sdiff %s%s\n", colorBold, path, colorReset)
@@ -1285,7 +1345,11 @@ Examples:
   claude-sync conflicts --keep local # Keep all local versions
   claude-sync conflicts --keep remote # Keep all remote versions`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			claudeDir := config.ClaudeDir()
+			cfg, err := config.Load()
+			if err != nil {
+				return err
+			}
+			claudeDir := cfg.LocalDir()
 
 			// Find all .conflict files
 			conflicts, err := findConflicts(claudeDir)
@@ -1313,7 +1377,7 @@ Examples:
 			}
 
 			// Load sync state to update after resolution
-			state, err := sync.LoadState()
+			state, err := sync.LoadStateFromDir(cfg.StateDirPath())
 			if err != nil {
 				return fmt.Errorf("failed to load sync state: %w", err)
 			}
@@ -1609,7 +1673,7 @@ Examples:
 						printWarning("Could not connect to storage: " + err.Error())
 					} else {
 						ctx := context.Background()
-						objects, err := store.List(ctx, "")
+						objects, err := store.List(ctx, cfg.EffectiveRemotePrefix())
 						if err != nil {
 							printWarning("Could not list objects: " + err.Error())
 						} else {
@@ -1629,7 +1693,11 @@ Examples:
 
 			// Clear local state if requested
 			if clearLocal {
-				statePath := config.StateFilePath()
+				stateDir := config.ConfigDirPath()
+				if cfg, err := config.Load(); err == nil {
+					stateDir = cfg.StateDirPath()
+				}
+				statePath := config.StateFilePathForDir(stateDir)
 				if err := os.Remove(statePath); err != nil && !os.IsNotExist(err) {
 					printWarning("Could not remove state file: " + err.Error())
 				} else {
@@ -1943,14 +2011,14 @@ func clearRemoteStorage(ctx context.Context, store storage.Storage) error {
 	return store.DeleteBatch(ctx, keys)
 }
 
-// hasExistingClaudeFiles checks if ~/.claude has any files that would be synced
-func hasExistingClaudeFiles() (bool, error) {
-	claudeDir := config.ClaudeDir()
-	if _, err := os.Stat(claudeDir); os.IsNotExist(err) {
+// hasExistingClaudeFiles checks if the configured source directory has any files that would be synced.
+func hasExistingClaudeFiles(syncer *sync.Syncer) (bool, error) {
+	localDir := syncer.LocalDir()
+	if _, err := os.Stat(localDir); os.IsNotExist(err) {
 		return false, nil
 	}
 
-	files, err := sync.GetLocalFiles(claudeDir, config.SyncPaths)
+	files, err := sync.GetLocalFiles(localDir, syncer.SyncPaths())
 	if err != nil {
 		return false, err
 	}
@@ -1977,7 +2045,7 @@ func handleFirstPullWithExistingFiles(ctx context.Context, syncer *sync.Syncer, 
 
 	// Show warning
 	fmt.Println()
-	printWarning("Local ~/.claude already has files that would be affected:")
+	printWarning("Local " + syncer.LocalDir() + " already has files that would be affected:")
 	fmt.Println()
 
 	// Show files that would be overwritten
@@ -2034,7 +2102,7 @@ func handleFirstPullWithExistingFiles(ctx context.Context, syncer *sync.Syncer, 
 	switch choice {
 	case 0:
 		// Backup and proceed
-		backupDir, err := createBackup()
+		backupDir, err := createBackup(syncer)
 		if err != nil {
 			return fmt.Errorf("failed to create backup: %w", err)
 		}
@@ -2054,9 +2122,9 @@ func handleFirstPullWithExistingFiles(ctx context.Context, syncer *sync.Syncer, 
 	}
 }
 
-// createBackup creates a backup of the current ~/.claude directory
-func createBackup() (string, error) {
-	claudeDir := config.ClaudeDir()
+// createBackup creates a backup of the current source directory.
+func createBackup(syncer *sync.Syncer) (string, error) {
+	claudeDir := syncer.LocalDir()
 	timestamp := time.Now().Format("20060102-150405")
 	backupDir := claudeDir + ".backup." + timestamp
 
@@ -2066,7 +2134,7 @@ func createBackup() (string, error) {
 	}
 
 	// Copy all syncable files to backup
-	files, err := sync.GetLocalFiles(claudeDir, config.SyncPaths)
+	files, err := sync.GetLocalFiles(claudeDir, syncer.SyncPaths())
 	if err != nil {
 		return "", fmt.Errorf("failed to list files: %w", err)
 	}

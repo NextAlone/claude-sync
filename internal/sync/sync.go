@@ -27,13 +27,15 @@ import (
 const defaultWorkers = 10
 
 type Syncer struct {
-	storage    storage.Storage
-	encryptor  *crypto.Encryptor
-	state      *SyncState
-	claudeDir  string
-	quiet      bool
-	onProgress ProgressFunc
-	cfg        *config.Config
+	storage      storage.Storage
+	encryptor    *crypto.Encryptor
+	state        *SyncState
+	claudeDir    string
+	syncPaths    []string
+	remotePrefix string
+	quiet        bool
+	onProgress   ProgressFunc
+	cfg          *config.Config
 }
 
 type SyncResult struct {
@@ -68,43 +70,50 @@ func NewSyncer(cfg *config.Config, quiet bool) (*Syncer, error) {
 		return nil, fmt.Errorf("failed to create encryptor: %w", err)
 	}
 
-	// Use overridden state path if provided, otherwise use default
-	var state *SyncState
-	if cfg.StateDirOverride != "" {
-		state, err = LoadStateFromDir(cfg.StateDirOverride)
-	} else {
-		state, err = LoadState()
-	}
+	state, err := LoadStateFromDir(cfg.StateDirPath())
 	if err != nil {
 		return nil, fmt.Errorf("failed to load state: %w", err)
 	}
 
-	// Use overridden claude dir if provided, otherwise use default
-	claudeDir := config.ClaudeDir()
-	if cfg.ClaudeDirOverride != "" {
-		claudeDir = cfg.ClaudeDirOverride
-	}
-
 	return &Syncer{
-		storage:   store,
-		encryptor: enc,
-		state:     state,
-		claudeDir: claudeDir,
-		quiet:     quiet,
-		cfg:       cfg,
+		storage:      store,
+		encryptor:    enc,
+		state:        state,
+		claudeDir:    cfg.LocalDir(),
+		syncPaths:    cfg.PathsToSync(),
+		remotePrefix: cfg.EffectiveRemotePrefix(),
+		quiet:        quiet,
+		cfg:          cfg,
 	}, nil
 }
 
 // NewSyncerWith creates a Syncer with pre-built dependencies (for testing).
 func NewSyncerWith(cfg *config.Config, store storage.Storage, enc *crypto.Encryptor, state *SyncState, claudeDir string, quiet bool) *Syncer {
 	return &Syncer{
-		storage:   store,
-		encryptor: enc,
-		state:     state,
-		claudeDir: claudeDir,
-		quiet:     quiet,
-		cfg:       cfg,
+		storage:      store,
+		encryptor:    enc,
+		state:        state,
+		claudeDir:    claudeDir,
+		syncPaths:    cfg.PathsToSync(),
+		remotePrefix: cfg.EffectiveRemotePrefix(),
+		quiet:        quiet,
+		cfg:          cfg,
 	}
+}
+
+func (s *Syncer) LocalDir() string {
+	return s.claudeDir
+}
+
+func (s *Syncer) SyncPaths() []string {
+	if len(s.syncPaths) == 0 {
+		return s.cfg.PathsToSync()
+	}
+	return s.syncPaths
+}
+
+func (s *Syncer) RemotePrefix() string {
+	return s.remotePrefix
 }
 
 func (s *Syncer) SetProgressFunc(fn ProgressFunc) {
@@ -132,7 +141,7 @@ func (s *Syncer) Push(ctx context.Context) (*SyncResult, error) {
 
 	s.progress(ProgressEvent{Action: "scan", Path: "Detecting changes..."})
 
-	changes, err := s.state.DetectChanges(s.claudeDir, config.SyncPaths, s.isExcluded)
+	changes, err := s.detectChanges()
 	if err != nil {
 		return nil, fmt.Errorf("failed to detect changes: %w", err)
 	}
@@ -230,7 +239,7 @@ func (s *Syncer) Pull(ctx context.Context) (*SyncResult, error) {
 	s.progress(ProgressEvent{Action: "scan", Path: "Fetching remote file list..."})
 
 	// List all remote objects
-	remoteObjects, err := s.storage.List(ctx, "")
+	remoteObjects, err := s.storage.List(ctx, s.remotePrefix)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list remote objects: %w", err)
 	}
@@ -260,7 +269,7 @@ func (s *Syncer) Pull(ctx context.Context) (*SyncResult, error) {
 	}
 
 	// Get current local files
-	localFiles, err := GetLocalFiles(s.claudeDir, config.SyncPaths, s.isExcluded)
+	localFiles, err := GetLocalFiles(s.claudeDir, s.SyncPaths(), s.isExcluded)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get local files: %w", err)
 	}
@@ -285,7 +294,7 @@ func (s *Syncer) Pull(ctx context.Context) (*SyncResult, error) {
 			if remoteObj.LastModified.After(stateFile.Uploaded) {
 				// Remote was updated after we last uploaded
 				// Check if local was also modified
-				localHash, _ := HashFile(filepath.Join(s.claudeDir, localPath))
+				localHash, _ := s.hashLocalFile(localPath)
 				if localHash != stateFile.Hash {
 					// Conflict: both changed
 					result.Conflicts = append(result.Conflicts, localPath)
@@ -364,7 +373,7 @@ func (s *Syncer) Pull(ctx context.Context) (*SyncResult, error) {
 }
 
 func (s *Syncer) Status(ctx context.Context) ([]FileChange, error) {
-	return s.state.DetectChanges(s.claudeDir, config.SyncPaths, s.isExcluded)
+	return s.detectChanges()
 }
 
 func (s *Syncer) uploadFile(ctx context.Context, relativePath string) error {
@@ -375,6 +384,7 @@ func (s *Syncer) uploadFile(ctx context.Context, relativePath string) error {
 	if err != nil {
 		return fmt.Errorf("failed to read file: %w", err)
 	}
+	data = s.prepareUploadData(relativePath, data)
 
 	// Compress
 	compressed, err := gzipCompress(data)
@@ -396,7 +406,7 @@ func (s *Syncer) uploadFile(ctx context.Context, relativePath string) error {
 
 	// Update state
 	info, _ := os.Stat(fullPath)
-	hash, _ := HashFile(fullPath)
+	hash, _ := s.hashLocalFile(relativePath)
 	s.state.UpdateFile(relativePath, info, hash)
 	s.state.MarkUploaded(relativePath)
 
@@ -417,13 +427,17 @@ func (s *Syncer) downloadFile(ctx context.Context, relativePath, remoteKey strin
 	}
 
 	// Write file
+	data, err = s.prepareDownloadData(relativePath, data)
+	if err != nil {
+		return err
+	}
 	if err := os.WriteFile(fullPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to write file: %w", err)
 	}
 
 	// Update state
 	info, _ := os.Stat(fullPath)
-	hash, _ := HashFile(fullPath)
+	hash, _ := s.hashLocalFile(relativePath)
 	s.state.UpdateFile(relativePath, info, hash)
 	s.state.MarkUploaded(relativePath)
 
@@ -442,9 +456,51 @@ func (s *Syncer) handleConflict(ctx context.Context, relativePath string, remote
 	return nil
 }
 
+func (s *Syncer) detectChanges() ([]FileChange, error) {
+	return s.state.DetectChangesWithHash(s.claudeDir, s.SyncPaths(), s.hashLocalFile, s.isExcluded)
+}
+
+func (s *Syncer) hashLocalFile(relativePath string) (string, error) {
+	fullPath := filepath.Join(s.claudeDir, relativePath)
+	data, err := os.ReadFile(fullPath)
+	if err != nil {
+		return "", err
+	}
+	if s.isCodexConfig(relativePath) {
+		return hashCodexConfig(data), nil
+	}
+	return HashBytes(data), nil
+}
+
+func (s *Syncer) prepareUploadData(relativePath string, data []byte) []byte {
+	if s.isCodexConfig(relativePath) {
+		return sanitizeCodexConfig(data)
+	}
+	return data
+}
+
+func (s *Syncer) prepareDownloadData(relativePath string, data []byte) ([]byte, error) {
+	if !s.isCodexConfig(relativePath) {
+		return data, nil
+	}
+	fullPath := filepath.Join(s.claudeDir, relativePath)
+	local, err := os.ReadFile(fullPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return sanitizeCodexConfig(data), nil
+		}
+		return nil, fmt.Errorf("failed to read local codex config: %w", err)
+	}
+	return mergeCodexConfig(local, data), nil
+}
+
+func (s *Syncer) isCodexConfig(relativePath string) bool {
+	return s.cfg.IsCodexProfile() && filepath.ToSlash(relativePath) == "config.toml"
+}
+
 func (s *Syncer) remoteKey(relativePath string) string {
 	// Add .age extension for encrypted files
-	return relativePath + ".age"
+	return s.remotePrefix + relativePath + ".age"
 }
 
 // FetchRemoteContent downloads, decrypts and decompresses a remote file
@@ -475,6 +531,7 @@ func (s *Syncer) fetchByRemoteKey(ctx context.Context, remoteKey string) ([]byte
 }
 
 func (s *Syncer) localPath(remoteKey string) string {
+	remoteKey = strings.TrimPrefix(remoteKey, s.remotePrefix)
 	// Remove .age extension
 	return strings.TrimSuffix(remoteKey, ".age")
 }
@@ -514,7 +571,7 @@ func (s *Syncer) PreviewPull(ctx context.Context) (*PullPreview, error) {
 	preview := &PullPreview{}
 
 	// List all remote objects
-	remoteObjects, err := s.storage.List(ctx, "")
+	remoteObjects, err := s.storage.List(ctx, s.remotePrefix)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list remote objects: %w", err)
 	}
@@ -537,7 +594,7 @@ func (s *Syncer) PreviewPull(ctx context.Context) (*PullPreview, error) {
 	}
 
 	// Get current local files
-	localFiles, err := GetLocalFiles(s.claudeDir, config.SyncPaths, s.isExcluded)
+	localFiles, err := GetLocalFiles(s.claudeDir, s.SyncPaths(), s.isExcluded)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get local files: %w", err)
 	}
@@ -566,7 +623,7 @@ func (s *Syncer) PreviewPull(ctx context.Context) (*PullPreview, error) {
 			// Check if remote is newer than our last known state
 			if remoteObj.LastModified.After(stateFile.Uploaded) {
 				// Remote was updated after we last uploaded
-				localHash, _ := HashFile(filepath.Join(s.claudeDir, localPath))
+				localHash, _ := s.hashLocalFile(localPath)
 				if localHash != stateFile.Hash {
 					// Conflict: both changed
 					preview.WouldConflict = append(preview.WouldConflict, fp)
@@ -616,13 +673,13 @@ func (s *Syncer) Diff(ctx context.Context) ([]DiffEntry, error) {
 	var entries []DiffEntry
 
 	// Get local files
-	localFiles, err := GetLocalFiles(s.claudeDir, config.SyncPaths, s.isExcluded)
+	localFiles, err := GetLocalFiles(s.claudeDir, s.SyncPaths(), s.isExcluded)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get local files: %w", err)
 	}
 
 	// Get remote files
-	remoteObjects, err := s.storage.List(ctx, "")
+	remoteObjects, err := s.storage.List(ctx, s.remotePrefix)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list remote objects: %w", err)
 	}
@@ -656,7 +713,7 @@ func (s *Syncer) Diff(ctx context.Context) ([]DiffEntry, error) {
 		} else {
 			stateFile := s.state.GetFile(relPath)
 			if stateFile != nil {
-				localHash, _ := HashFile(filepath.Join(s.claudeDir, relPath))
+				localHash, _ := s.hashLocalFile(relPath)
 				if localHash != stateFile.Hash || remoteObj.LastModified.After(stateFile.Uploaded) {
 					entries = append(entries, DiffEntry{
 						Path:       relPath,
@@ -760,7 +817,7 @@ func (s *Syncer) PushMCP(ctx context.Context) (*MCPPushResult, error) {
 		return nil, fmt.Errorf("failed to encrypt: %w", err)
 	}
 
-	remoteKey := config.MCPRemoteKey + ".age"
+	remoteKey := s.remoteKey(config.MCPRemoteKey)
 	if err := s.storage.Upload(ctx, remoteKey, encrypted); err != nil {
 		return nil, fmt.Errorf("failed to upload MCP servers: %w", err)
 	}
@@ -793,7 +850,7 @@ func (s *Syncer) PullMCP(ctx context.Context) (*MCPPullResult, error) {
 	result := &MCPPullResult{}
 
 	// Download remote MCP data
-	remoteKey := config.MCPRemoteKey + ".age"
+	remoteKey := s.remoteKey(config.MCPRemoteKey)
 	encrypted, err := s.storage.Download(ctx, remoteKey)
 	if err != nil {
 		// If the key doesn't exist, no remote MCP data

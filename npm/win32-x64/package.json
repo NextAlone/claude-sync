@@ -5,7 +5,8 @@
   "os": ["win32"],
   "cpu": ["x64"],
   "bin": {
-    "claude-sync": "claude-sync.exe"
+    "claude-sync": "claude-sync.exe",
+    "codex-sync": "claude-sync.exe"
   },
   "license": "MIT",
   "repository": {

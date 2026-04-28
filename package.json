@@ -3,7 +3,8 @@
   "version": "0.4.0",
   "description": "Sync Claude Code sessions across devices with encrypted cloud storage",
   "bin": {
-    "claude-sync": "./bin/claude-sync.js"
+    "claude-sync": "./bin/claude-sync.js",
+    "codex-sync": "./bin/claude-sync.js"
   },
   "keywords": [
     "claude",

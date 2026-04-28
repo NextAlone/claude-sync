@@ -5,7 +5,8 @@
   "os": ["darwin"],
   "cpu": ["arm64"],
   "bin": {
-    "claude-sync": "claude-sync"
+    "claude-sync": "claude-sync",
+    "codex-sync": "claude-sync"
   },
   "license": "MIT",
   "repository": {

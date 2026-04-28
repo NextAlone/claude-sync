@@ -35,6 +35,21 @@ type Config struct {
 	// Common fields
 	EncryptionKey string `yaml:"encryption_key_path"`
 
+	// AppName labels the synced application in user-facing output.
+	AppName string `yaml:"app_name,omitempty"`
+
+	// SourceDir is the local directory to sync. Defaults to ~/.claude.
+	SourceDir string `yaml:"source_dir,omitempty"`
+
+	// StateDir stores sync metadata. Defaults to ~/.claude-sync.
+	StateDir string `yaml:"state_dir,omitempty"`
+
+	// RemotePrefix isolates objects in shared buckets, e.g. "codex/".
+	RemotePrefix string `yaml:"remote_prefix,omitempty"`
+
+	// SyncPaths overrides the paths under SourceDir that should be synced.
+	SyncPaths []string `yaml:"sync_paths,omitempty"`
+
 	// Exclude patterns (glob-style) for paths to skip during sync
 	Exclude []string `yaml:"exclude,omitempty"`
 
@@ -69,7 +84,37 @@ var SyncPaths = []string{
 	"hooks",
 }
 
+var CodexSyncPaths = []string{
+	"AGENTS.md",
+	"config.toml",
+	"hooks.json",
+	"skills",
+	"plugins",
+}
+
+var CodexExclude = []string{
+	"auth.json",
+	"*.sqlite",
+	"*.sqlite-*",
+	"*.jsonl",
+	".tmp/**",
+	"cache/**",
+	"log/**",
+	"sessions/**",
+	"shell_snapshots/**",
+	"tmp/**",
+	"vendor_imports/**",
+	"models_cache.json",
+}
+
 func ConfigDirPath() string {
+	if dir := os.Getenv("CLAUDE_SYNC_CONFIG_DIR"); dir != "" {
+		if strings.HasPrefix(dir, "~") {
+			home, _ := os.UserHomeDir()
+			return filepath.Join(home, dir[1:])
+		}
+		return dir
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""
@@ -85,6 +130,10 @@ func StateFilePath() string {
 	return filepath.Join(ConfigDirPath(), StateFile)
 }
 
+func StateFilePathForDir(dir string) string {
+	return filepath.Join(dir, StateFile)
+}
+
 func AgeKeyFilePath() string {
 	return filepath.Join(ConfigDirPath(), AgeKeyFile)
 }
@@ -95,6 +144,14 @@ func ClaudeDir() string {
 		return ""
 	}
 	return filepath.Join(home, ".claude")
+}
+
+func CodexDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".codex")
 }
 
 // ClaudeJSONPath returns the path to ~/.claude.json where global MCP servers are configured.
@@ -112,7 +169,7 @@ func Load() (*Config, error) {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("config not found: run 'claude-sync init' first")
+			return nil, fmt.Errorf("config not found: run init first")
 		}
 		return nil, fmt.Errorf("failed to read config: %w", err)
 	}
@@ -127,6 +184,15 @@ func Load() (*Config, error) {
 		home, _ := os.UserHomeDir()
 		cfg.EncryptionKey = filepath.Join(home, cfg.EncryptionKey[1:])
 	}
+	if cfg.SourceDir != "" && cfg.SourceDir[0] == '~' {
+		home, _ := os.UserHomeDir()
+		cfg.SourceDir = filepath.Join(home, cfg.SourceDir[1:])
+	}
+	if cfg.StateDir != "" && cfg.StateDir[0] == '~' {
+		home, _ := os.UserHomeDir()
+		cfg.StateDir = filepath.Join(home, cfg.StateDir[1:])
+	}
+	cfg.RemotePrefix = NormalizeRemotePrefix(cfg.RemotePrefix)
 
 	// Set default endpoint for Cloudflare R2
 	if cfg.Endpoint == "" && cfg.AccountID != "" {
@@ -158,6 +224,59 @@ func Save(cfg *Config) error {
 func Exists() bool {
 	_, err := os.Stat(ConfigFilePath())
 	return err == nil
+}
+
+func (c *Config) DisplayName() string {
+	if c.AppName != "" {
+		return c.AppName
+	}
+	return "Claude"
+}
+
+func (c *Config) LocalDir() string {
+	if c.ClaudeDirOverride != "" {
+		return c.ClaudeDirOverride
+	}
+	if c.SourceDir != "" {
+		return c.SourceDir
+	}
+	return ClaudeDir()
+}
+
+func (c *Config) StateDirPath() string {
+	if c.StateDirOverride != "" {
+		return c.StateDirOverride
+	}
+	if c.StateDir != "" {
+		return c.StateDir
+	}
+	return ConfigDirPath()
+}
+
+func (c *Config) PathsToSync() []string {
+	if len(c.SyncPaths) > 0 {
+		return c.SyncPaths
+	}
+	return SyncPaths
+}
+
+func (c *Config) EffectiveRemotePrefix() string {
+	return NormalizeRemotePrefix(c.RemotePrefix)
+}
+
+func (c *Config) IsCodexProfile() bool {
+	return strings.EqualFold(c.AppName, "Codex") ||
+		strings.HasSuffix(filepath.ToSlash(c.SourceDir), "/.codex") ||
+		c.EffectiveRemotePrefix() == "codex/"
+}
+
+func NormalizeRemotePrefix(prefix string) string {
+	prefix = strings.TrimSpace(filepath.ToSlash(prefix))
+	prefix = strings.Trim(prefix, "/")
+	if prefix == "" {
+		return ""
+	}
+	return prefix + "/"
 }
 
 // GetStorageConfig returns the storage configuration, migrating from legacy format if needed

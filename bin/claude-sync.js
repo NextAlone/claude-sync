@@ -50,10 +50,12 @@ function getBinaryPath() {
 
 const binary = getBinaryPath();
 const args = process.argv.slice(2);
+const wrapperName = path.basename(process.argv[1] || "claude-sync");
 
 const child = spawn(binary, args, {
   stdio: "inherit",
   env: process.env,
+  argv0: wrapperName,
 });
 
 child.on("error", (err) => {

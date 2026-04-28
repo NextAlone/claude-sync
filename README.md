@@ -155,6 +155,68 @@ claude-sync pull
 | `~/.claude/settings.local.json` | Local settings |
 | `~/.claude/CLAUDE.md` | Global instructions |
 
+## Syncing Codex
+
+`claude-sync` can also manage a second profile for Codex by using a separate
+config directory, local source directory, state directory, and remote prefix.
+This keeps Claude and Codex objects isolated even when they share the same
+bucket and encryption key.
+
+Initialize a Codex profile:
+
+```bash
+codex-sync init
+```
+
+The generated config is equivalent to:
+
+```yaml
+storage:
+  provider: r2
+  bucket: claude-sync
+  account_id: YOUR_ACCOUNT_ID
+  access_key_id: YOUR_ACCESS_KEY
+  secret_access_key: YOUR_SECRET_KEY
+encryption_key_path: ~/.codex-sync/age-key.txt
+app_name: Codex
+source_dir: ~/.codex
+state_dir: ~/.codex-sync
+remote_prefix: codex/
+sync_paths:
+  - AGENTS.md
+  - config.toml
+  - hooks.json
+  - skills
+  - plugins
+exclude:
+  - auth.json
+  - "*.sqlite"
+  - "*.sqlite-*"
+  - "*.jsonl"
+  - ".tmp/**"
+  - "cache/**"
+  - "log/**"
+  - "sessions/**"
+  - "shell_snapshots/**"
+  - "tmp/**"
+  - "vendor_imports/**"
+  - models_cache.json
+```
+
+Then run Codex sync commands with:
+
+```bash
+codex-sync status
+codex-sync push
+codex-sync pull
+```
+
+`codex-sync` is an alias for the same sync engine. It defaults to
+`~/.codex-sync`, applies the Codex profile during `init`, and isolates remote
+objects under `codex/`. The same behavior is available through
+`claude-sync --config-dir ~/.codex-sync --app codex` and the
+`CLAUDE_SYNC_CONFIG_DIR` environment variable.
+
 ## Limitations
 
 ### Path-Based Session Indexing
@@ -205,6 +267,7 @@ claude-sync pull --force      # Skip confirmation prompts
 claude-sync init              # Full setup wizard
 claude-sync init --passphrase # Re-enter passphrase only (keeps storage config)
 claude-sync init --force      # Reset everything, start fresh
+codex-sync init               # Full setup wizard for ~/.codex
 ```
 
 ### Quiet Mode

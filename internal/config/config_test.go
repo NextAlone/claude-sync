@@ -146,7 +146,7 @@ func TestLoadNotFound(t *testing.T) {
 		t.Fatal("Load should fail when config doesn't exist")
 	}
 
-	if !strings.Contains(err.Error(), "run 'claude-sync init' first") {
+	if !strings.Contains(err.Error(), "run init first") {
 		t.Errorf("Error should mention running init, got: %v", err)
 	}
 }
