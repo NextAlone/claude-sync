@@ -32,6 +32,9 @@ type SyncState struct {
 	// MCPBaseline stores the last-synced normalized MCP server configs for three-way merge.
 	MCPBaseline json.RawMessage `json:"mcp_baseline,omitempty"`
 
+	// SettingsBaseline stores the last-synced sanitized settings.json for three-way merge.
+	SettingsBaseline json.RawMessage `json:"settings_baseline,omitempty"`
+
 	// savePath is the custom path to save state to (if set)
 	savePath string     `json:"-"`
 	mu       sync.Mutex `json:"-"`
@@ -168,6 +171,36 @@ func (s *SyncState) SetMCPBaseline(servers MCPServers) error {
 		return fmt.Errorf("failed to serialize MCP baseline: %w", err)
 	}
 	s.MCPBaseline = data
+	return nil
+}
+
+// GetSettingsBaseline returns the last-synced sanitized settings.json for three-way merge.
+func (s *SyncState) GetSettingsBaseline() map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.SettingsBaseline) == 0 {
+		return nil
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(s.SettingsBaseline, &raw); err != nil {
+		return nil
+	}
+	return raw
+}
+
+// SetSettingsBaseline stores the sanitized settings.json as the baseline for future merges.
+func (s *SyncState) SetSettingsBaseline(raw map[string]any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if raw == nil {
+		s.SettingsBaseline = nil
+		return nil
+	}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return fmt.Errorf("failed to serialize settings baseline: %w", err)
+	}
+	s.SettingsBaseline = data
 	return nil
 }
 

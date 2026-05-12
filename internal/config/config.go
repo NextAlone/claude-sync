@@ -56,6 +56,9 @@ type Config struct {
 	// MCPSync enables syncing MCP server configs from ~/.claude.json
 	MCPSync bool `yaml:"mcp_sync,omitempty"`
 
+	// SettingsSync controls field-level sync for settings.json.
+	SettingsSync *SettingsSyncConfig `yaml:"settings_sync,omitempty"`
+
 	// ClaudeDirOverride allows overriding the default ~/.claude path (for testing)
 	ClaudeDirOverride string `yaml:"-"`
 
@@ -64,6 +67,14 @@ type Config struct {
 
 	// ClaudeJSONOverride allows overriding the ~/.claude.json path (for testing)
 	ClaudeJSONOverride string `yaml:"-"`
+}
+
+// SettingsSyncConfig controls how settings.json is synced with field-level merge.
+type SettingsSyncConfig struct {
+	// StripKeys are JSON paths to strip before upload.
+	// Dot-separated: "env.ANTHROPIC_AUTH_TOKEN" strips that nested key.
+	// Top-level key: "env" strips the entire "env" block.
+	StripKeys []string `yaml:"strip_keys,omitempty"`
 }
 
 // SyncPaths defines which paths under ~/.claude to sync

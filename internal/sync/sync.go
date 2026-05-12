@@ -287,6 +287,17 @@ func (s *Syncer) Pull(ctx context.Context) (*SyncResult, error) {
 
 		shouldDownload := false
 
+		// Settings JSON with field-level merge: always pull and let merge sort it out.
+		if s.isSettingsJSON(localPath) {
+			if !localExists || (stateFile != nil && remoteObj.LastModified.After(stateFile.Uploaded)) || stateFile == nil {
+				shouldDownload = true
+			}
+			if shouldDownload {
+				toDownload = append(toDownload, downloadTask{localPath, remoteObj})
+			}
+			continue
+		}
+
 		if !localExists {
 			shouldDownload = true
 		} else if stateFile != nil {
@@ -410,6 +421,12 @@ func (s *Syncer) uploadFile(ctx context.Context, relativePath string) error {
 	s.state.UpdateFile(relativePath, info, hash)
 	s.state.MarkUploaded(relativePath)
 
+	if s.isSettingsJSON(relativePath) {
+		if err := s.saveSettingsBaseline(); err != nil {
+			return fmt.Errorf("failed to save settings baseline: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -441,6 +458,12 @@ func (s *Syncer) downloadFile(ctx context.Context, relativePath, remoteKey strin
 	s.state.UpdateFile(relativePath, info, hash)
 	s.state.MarkUploaded(relativePath)
 
+	if s.isSettingsJSON(relativePath) {
+		if err := s.saveSettingsBaseline(); err != nil {
+			return fmt.Errorf("failed to save settings baseline: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -461,6 +484,9 @@ func (s *Syncer) detectChanges() ([]FileChange, error) {
 }
 
 func (s *Syncer) hashLocalFile(relativePath string) (string, error) {
+	if s.isSettingsJSON(relativePath) {
+		return s.canonicalSettingsHash(relativePath)
+	}
 	fullPath := filepath.Join(s.claudeDir, relativePath)
 	data, err := os.ReadFile(fullPath)
 	if err != nil {
@@ -476,10 +502,20 @@ func (s *Syncer) prepareUploadData(relativePath string, data []byte) []byte {
 	if s.isCodexConfig(relativePath) {
 		return sanitizeCodexConfig(data)
 	}
+	if s.isSettingsJSON(relativePath) {
+		stripped, err := s.prepareSettingsForUpload(data)
+		if err != nil {
+			return data
+		}
+		return stripped
+	}
 	return data
 }
 
 func (s *Syncer) prepareDownloadData(relativePath string, data []byte) ([]byte, error) {
+	if s.isSettingsJSON(relativePath) {
+		return s.prepareSettingsForDownload(data)
+	}
 	if !s.isCodexConfig(relativePath) {
 		return data, nil
 	}
