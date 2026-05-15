@@ -14,12 +14,18 @@ import (
 	"github.com/tawanorg/claude-sync/internal/config"
 )
 
+const (
+	OriginPull = "pull"
+	OriginPush = "push"
+)
+
 type FileState struct {
 	Path     string    `json:"path"`
 	Hash     string    `json:"hash"`
 	Size     int64     `json:"size"`
 	ModTime  time.Time `json:"mod_time"`
 	Uploaded time.Time `json:"uploaded,omitempty"`
+	Origin   string    `json:"origin,omitempty"` // "pull" or "push", tracks last sync direction
 }
 
 type SyncState struct {
@@ -117,6 +123,26 @@ func (s *SyncState) UpdateFile(relativePath string, info os.FileInfo, hash strin
 		Size:    info.Size(),
 		ModTime: info.ModTime(),
 	}
+}
+
+func (s *SyncState) SetOrigin(relativePath, origin string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if f, ok := s.Files[relativePath]; ok {
+		f.Origin = origin
+	}
+}
+
+func (s *SyncState) FindOrphans(remotePaths map[string]bool) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var orphans []string
+	for path, f := range s.Files {
+		if f.Origin == OriginPull && !remotePaths[path] {
+			orphans = append(orphans, path)
+		}
+	}
+	return orphans
 }
 
 func (s *SyncState) MarkUploaded(relativePath string) {

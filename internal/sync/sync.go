@@ -43,6 +43,7 @@ type SyncResult struct {
 	Downloaded []string
 	Deleted    []string
 	Conflicts  []string
+	Orphans    []string
 	Errors     []error
 }
 
@@ -245,7 +246,16 @@ func (s *Syncer) Pull(ctx context.Context) (*SyncResult, error) {
 	}
 
 	if len(remoteObjects) == 0 {
-		s.progress(ProgressEvent{Action: "scan", Complete: true})
+		// Still check for orphans when remote is completely empty
+		remotePathSet := make(map[string]bool)
+		result.Orphans = s.state.FindOrphans(remotePathSet)
+		if len(result.Orphans) > 0 {
+			s.state.LastPull = time.Now()
+			s.state.LastSync = time.Now()
+			s.state.Save()
+		} else {
+			s.progress(ProgressEvent{Action: "scan", Complete: true})
+		}
 		return result, nil
 	}
 
@@ -374,6 +384,13 @@ func (s *Syncer) Pull(ctx context.Context) (*SyncResult, error) {
 
 	s.progress(ProgressEvent{Action: "download", Complete: true, Total: total})
 
+	// Detect orphans: files pulled before but no longer in remote
+	remotePathSet := make(map[string]bool)
+	for p := range remoteFiles {
+		remotePathSet[p] = true
+	}
+	result.Orphans = s.state.FindOrphans(remotePathSet)
+
 	s.state.LastPull = time.Now()
 	s.state.LastSync = time.Now()
 	if err := s.state.Save(); err != nil {
@@ -420,6 +437,7 @@ func (s *Syncer) uploadFile(ctx context.Context, relativePath string) error {
 	hash, _ := s.hashLocalFile(relativePath)
 	s.state.UpdateFile(relativePath, info, hash)
 	s.state.MarkUploaded(relativePath)
+	s.state.SetOrigin(relativePath, OriginPush)
 
 	if s.isSettingsJSON(relativePath) {
 		if err := s.saveSettingsBaseline(); err != nil {
@@ -457,6 +475,7 @@ func (s *Syncer) downloadFile(ctx context.Context, relativePath, remoteKey strin
 	hash, _ := s.hashLocalFile(relativePath)
 	s.state.UpdateFile(relativePath, info, hash)
 	s.state.MarkUploaded(relativePath)
+	s.state.SetOrigin(relativePath, OriginPull)
 
 	if s.isSettingsJSON(relativePath) {
 		if err := s.saveSettingsBaseline(); err != nil {
@@ -599,6 +618,7 @@ type PullPreview struct {
 	WouldKeep      []FilePreview // Local files that would be kept (local newer)
 	WouldConflict  []FilePreview // Files that would create a conflict
 	LocalOnlyFiles []FilePreview // Files that exist only locally
+	OrphanedFiles  []FilePreview // Files pulled before, now deleted upstream
 }
 
 // PreviewPull returns a preview of what would happen during a pull operation
@@ -681,15 +701,24 @@ func (s *Syncer) PreviewPull(ctx context.Context) (*PullPreview, error) {
 		}
 	}
 
-	// Find local-only files
+	// Find local-only and orphaned files
 	for localPath, localInfo := range localFiles {
 		if _, exists := remoteFiles[localPath]; !exists {
-			preview.LocalOnlyFiles = append(preview.LocalOnlyFiles, FilePreview{
-				Path:      localPath,
-				LocalTime: localInfo.ModTime(),
-				LocalSize: localInfo.Size(),
-				LocalOnly: true,
-			})
+			if sf := s.state.GetFile(localPath); sf != nil && sf.Origin == OriginPull {
+				preview.OrphanedFiles = append(preview.OrphanedFiles, FilePreview{
+					Path:      localPath,
+					LocalTime: localInfo.ModTime(),
+					LocalSize: localInfo.Size(),
+					LocalOnly: true,
+				})
+			} else {
+				preview.LocalOnlyFiles = append(preview.LocalOnlyFiles, FilePreview{
+					Path:      localPath,
+					LocalTime: localInfo.ModTime(),
+					LocalSize: localInfo.Size(),
+					LocalOnly: true,
+				})
+			}
 		}
 	}
 
@@ -703,6 +732,13 @@ type DiffEntry struct {
 	RemoteSize int64
 	LocalTime  time.Time
 	RemoteTime time.Time
+}
+
+func orphanStatus(relPath string, state *SyncState) string {
+    if sf := state.GetFile(relPath); sf != nil && sf.Origin == OriginPull {
+        return "orphaned"
+    }
+    return "local_only"
 }
 
 func (s *Syncer) Diff(ctx context.Context) ([]DiffEntry, error) {
@@ -742,7 +778,7 @@ func (s *Syncer) Diff(ctx context.Context) ([]DiffEntry, error) {
 		if !exists {
 			entries = append(entries, DiffEntry{
 				Path:      relPath,
-				Status:    "local_only",
+				Status:    orphanStatus(relPath, s.state),
 				LocalSize: info.Size(),
 				LocalTime: info.ModTime(),
 			})
@@ -866,6 +902,7 @@ func (s *Syncer) PushMCP(ctx context.Context) (*MCPPushResult, error) {
 		Size:     int64(len(data)),
 		ModTime:  time.Now(),
 		Uploaded: time.Now(),
+		Origin:   OriginPush,
 	}
 	s.state.mu.Unlock()
 
@@ -965,6 +1002,7 @@ func (s *Syncer) PullMCP(ctx context.Context) (*MCPPullResult, error) {
 		Size:     int64(len(decrypted)),
 		ModTime:  time.Now(),
 		Uploaded: time.Now(),
+		Origin:   OriginPull,
 	}
 	s.state.mu.Unlock()
 
@@ -1017,6 +1055,18 @@ func (s *Syncer) MCPStatus(ctx context.Context) (*MCPStatusResult, error) {
 	result.HasChanges = stateFile == nil || stateFile.Hash != newHash
 
 	return result, nil
+}
+
+// PruneOrphans deletes orphaned files locally and removes them from state.
+func (s *Syncer) PruneOrphans(orphans []string) error {
+	for _, path := range orphans {
+		fullPath := filepath.Join(s.claudeDir, path)
+		if err := os.Remove(fullPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("failed to remove orphan %s: %w", path, err)
+		}
+		s.state.RemoveFile(path)
+	}
+	return s.state.Save()
 }
 
 // isGzipped checks if data starts with the gzip magic number (0x1f 0x8b).

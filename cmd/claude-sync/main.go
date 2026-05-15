@@ -910,7 +910,7 @@ func pushCmd() *cobra.Command {
 }
 
 func pullCmd() *cobra.Command {
-	var dryRun, force, includeMCP bool
+	var dryRun, force, includeMCP, prune bool
 
 	cmd := &cobra.Command{
 		Use:   "pull",
@@ -1029,6 +1029,26 @@ Examples:
 							fmt.Printf("  %s•%s %v\n", colorYellow, colorReset, e)
 						}
 					}
+
+					if len(result.Orphans) > 0 {
+						fmt.Printf("\n%sOrphaned files (deleted upstream):%s\n", colorYellow, colorReset)
+						for _, o := range result.Orphans {
+							fmt.Printf("  %s✗%s %s\n", colorYellow, colorReset, o)
+						}
+						if !prune {
+							fmt.Printf("\n%sRun 'claude-sync pull --prune' to delete them.%s\n", colorDim, colorReset)
+						}
+					}
+				}
+			}
+
+			// Prune orphans if requested
+			if prune && len(result.Orphans) > 0 {
+				if err := syncer.PruneOrphans(result.Orphans); err != nil {
+					return fmt.Errorf("failed to prune orphans: %w", err)
+				}
+				if !quiet {
+					fmt.Printf("%s✓%s Pruned %d orphaned file(s)\n", colorGreen, colorReset, len(result.Orphans))
 				}
 			}
 
@@ -1045,6 +1065,7 @@ Examples:
 
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show what would be changed without making changes")
 	cmd.Flags().BoolVar(&force, "force", false, "Overwrite existing files without confirmation")
+	cmd.Flags().BoolVar(&prune, "prune", false, "Delete local files that were removed upstream")
 	cmd.Flags().BoolVar(&includeMCP, "include-mcp", false, "Also sync MCP server configs from ~/.claude.json")
 
 	return cmd
@@ -1275,9 +1296,11 @@ func diffCmd() *cobra.Command {
 				return nil
 			}
 
-			var localOnly, remoteOnly, modified, synced []sync.DiffEntry
+			var localOnly, remoteOnly, modified, synced, orphaned []sync.DiffEntry
 			for _, e := range entries {
 				switch e.Status {
+				case "orphaned":
+					orphaned = append(orphaned, e)
 				case "local_only":
 					localOnly = append(localOnly, e)
 				case "remote_only":
@@ -1289,6 +1312,14 @@ func diffCmd() *cobra.Command {
 				}
 			}
 
+			if len(orphaned) > 0 {
+				fmt.Printf("Orphaned - deleted upstream (%d files):\n", len(orphaned))
+				for _, e := range orphaned {
+					fmt.Printf("  %s✗%s %s (%s)\n", colorYellow, colorReset, e.Path, util.FormatSize(e.LocalSize))
+				}
+				fmt.Println()
+			}
+			
 			if len(localOnly) > 0 {
 				fmt.Printf("Local only (%d files):\n", len(localOnly))
 				for _, e := range localOnly {
@@ -1313,8 +1344,8 @@ func diffCmd() *cobra.Command {
 				fmt.Println()
 			}
 
-			fmt.Printf("Summary: %d synced, %d local only, %d remote only, %d modified\n",
-				len(synced), len(localOnly), len(remoteOnly), len(modified))
+			fmt.Printf("Summary: %d synced, %d local only, %d remote only, %d modified, %d orphaned\n",
+				len(synced), len(localOnly), len(remoteOnly), len(modified), len(orphaned))
 
 			return nil
 		},
@@ -2066,6 +2097,11 @@ func handleFirstPullWithExistingFiles(ctx context.Context, syncer *sync.Syncer, 
 		fmt.Printf("  %sKEEP%s       %s %s(local newer)%s\n", colorCyan, colorReset, f.Path, colorDim, colorReset)
 	}
 
+	// Show orphaned files
+	for _, f := range preview.OrphanedFiles {
+		fmt.Printf("  %sORPHAN%s     %s %s(deleted upstream)%s\n", colorYellow, colorReset, f.Path, colorDim, colorReset)
+	}
+
 	// Show local-only files
 	for _, f := range preview.LocalOnlyFiles {
 		fmt.Printf("  %sKEEP%s       %s %s(local only)%s\n", colorCyan, colorReset, f.Path, colorDim, colorReset)
@@ -2218,13 +2254,32 @@ func showPullPreview(ctx context.Context, syncer *sync.Syncer) error {
 		fmt.Println()
 	}
 
+	// Show orphaned files
+	if len(preview.OrphanedFiles) > 0 {
+		fmt.Printf("Would report as orphaned - deleted upstream (%d files):\n", len(preview.OrphanedFiles))
+		for _, f := range preview.OrphanedFiles {
+			fmt.Printf("  %s✗%s %s (%s)\n", colorYellow, colorReset, f.Path, util.FormatSize(f.LocalSize))
+		}
+		fmt.Println()
+	}
+
+	// Show local-only files
+	if len(preview.LocalOnlyFiles) > 0 {
+		fmt.Printf("Local only (%d files):\n", len(preview.LocalOnlyFiles))
+		for _, f := range preview.LocalOnlyFiles {
+			fmt.Printf("  %s+%s %s (%s)\n", colorGreen, colorReset, f.Path, util.FormatSize(f.LocalSize))
+		}
+		fmt.Println()
+	}
+
 	// Summary
-	fmt.Printf("%sSummary:%s %d would download, %d would overwrite, %d conflicts, %d unchanged\n",
+	fmt.Printf("%sSummary:%s %d would download, %d would overwrite, %d conflicts, %d unchanged, %d orphaned\n",
 		colorBold, colorReset,
 		len(preview.WouldDownload),
 		len(preview.WouldOverwrite),
 		len(preview.WouldConflict),
-		len(preview.WouldKeep))
+		len(preview.WouldKeep),
+		len(preview.OrphanedFiles))
 	fmt.Println()
 	fmt.Printf("%sRun 'claude-sync pull' to apply these changes.%s\n", colorDim, colorReset)
 

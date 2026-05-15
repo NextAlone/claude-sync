@@ -601,3 +601,165 @@ func TestPullEmptyRemoteIsNoop(t *testing.T) {
 		t.Errorf("Expected 0 downloads, got %d", len(result.Downloaded))
 	}
 }
+
+func TestPullDetectsOrphans(t *testing.T) {
+	ctx := context.Background()
+
+	// Device A: create file and push
+	envA := setupTestEnv(t)
+	writeFile(t, envA.claudeDir, "CLAUDE.md", "# Device A")
+	result, err := envA.syncer.Push(ctx)
+	if err != nil {
+		t.Fatalf("Push A failed: %v", err)
+	}
+	if len(result.Uploaded) != 1 {
+		t.Fatalf("Expected 1 upload, got %d", len(result.Uploaded))
+	}
+	// Verify Origin is "push" after push
+	sf := envA.syncer.state.GetFile("CLAUDE.md")
+	if sf.Origin != OriginPush {
+		t.Errorf("Expected Origin=push after push, got %q", sf.Origin)
+	}
+
+	// Device B: pull the file (simulate another device)
+	envB := setupTestEnv(t)
+	envB.syncer.storage = envA.store // share same storage
+	result, err = envB.syncer.Pull(ctx)
+	if err != nil {
+		t.Fatalf("Pull B failed: %v", err)
+	}
+	if len(result.Downloaded) != 1 {
+		t.Fatalf("Expected 1 download, got %d", len(result.Downloaded))
+	}
+	// Verify Origin is "pull" after pull on device B
+	sfB := envB.syncer.state.GetFile("CLAUDE.md")
+	if sfB.Origin != OriginPull {
+		t.Errorf("Expected Origin=pull after pull, got %q", sfB.Origin)
+	}
+	// Verify file exists locally on B
+	if _, err := os.Stat(filepath.Join(envB.claudeDir, "CLAUDE.md")); os.IsNotExist(err) {
+		t.Fatal("CLAUDE.md should exist on device B after pull")
+	}
+
+	// Device A: delete the file locally and push the delete
+	os.Remove(filepath.Join(envA.claudeDir, "CLAUDE.md"))
+	result, err = envA.syncer.Push(ctx)
+	if err != nil {
+		t.Fatalf("Push delete failed: %v", err)
+	}
+	if len(result.Deleted) != 1 {
+		t.Fatalf("Expected 1 delete, got %d", len(result.Deleted))
+	}
+
+	// Device B: pull again — should detect orphan
+	result, err = envB.syncer.Pull(ctx)
+	if err != nil {
+		t.Fatalf("Pull B (second) failed: %v", err)
+	}
+	if len(result.Orphans) != 1 {
+		t.Errorf("Expected 1 orphan, got %d", len(result.Orphans))
+	}
+	if len(result.Orphans) > 0 && result.Orphans[0] != "CLAUDE.md" {
+		t.Errorf("Expected orphan CLAUDE.md, got %v", result.Orphans)
+	}
+
+	// File should still exist locally (not pruned)
+	if _, err := os.Stat(filepath.Join(envB.claudeDir, "CLAUDE.md")); os.IsNotExist(err) {
+		t.Fatal("CLAUDE.md should still exist — orphan reported but not auto-deleted")
+	}
+}
+
+func TestPruneOrphansDeletesFiles(t *testing.T) {
+	ctx := context.Background()
+
+	// Setup: push from A, pull on B, delete from A
+	envA := setupTestEnv(t)
+	writeFile(t, envA.claudeDir, "rules/test.md", "# test rule")
+	envA.syncer.Push(ctx)
+
+	envB := setupTestEnv(t)
+	envB.syncer.storage = envA.store
+	envB.syncer.Pull(ctx)
+
+	os.Remove(filepath.Join(envA.claudeDir, "rules/test.md"))
+	envA.syncer.Push(ctx)
+
+	// Pull on B to detect orphan
+	result, err := envB.syncer.Pull(ctx)
+	if err != nil {
+		t.Fatalf("Pull failed: %v", err)
+	}
+	if len(result.Orphans) != 1 {
+		t.Fatalf("Expected 1 orphan, got %d", len(result.Orphans))
+	}
+
+	// Prune
+	if err := envB.syncer.PruneOrphans(result.Orphans); err != nil {
+		t.Fatalf("PruneOrphans failed: %v", err)
+	}
+
+	// File should be deleted
+	if _, err := os.Stat(filepath.Join(envB.claudeDir, "rules/test.md")); !os.IsNotExist(err) {
+		t.Fatal("rules/test.md should be deleted after prune")
+	}
+
+	// State should be cleaned
+	if sf := envB.syncer.state.GetFile("rules/test.md"); sf != nil {
+		t.Error("State should not have entry for pruned file")
+	}
+}
+
+func TestDiffShowsOrphanedStatus(t *testing.T) {
+	ctx := context.Background()
+
+	// Push from A, pull on B, delete from A
+	envA := setupTestEnv(t)
+	writeFile(t, envA.claudeDir, "CLAUDE.md", "# from A")
+	envA.syncer.Push(ctx)
+
+	envB := setupTestEnv(t)
+	envB.syncer.storage = envA.store
+	envB.syncer.Pull(ctx)
+
+	os.Remove(filepath.Join(envA.claudeDir, "CLAUDE.md"))
+	envA.syncer.Push(ctx)
+
+	// Diff on B should show "orphaned", not "local_only"
+	entries, err := envB.syncer.Diff(ctx)
+	if err != nil {
+		t.Fatalf("Diff failed: %v", err)
+	}
+
+	for _, e := range entries {
+		if e.Path == "CLAUDE.md" {
+			if e.Status != "orphaned" {
+				t.Errorf("Expected status 'orphaned' for CLAUDE.md, got %q", e.Status)
+			}
+			return
+		}
+	}
+	t.Error("CLAUDE.md not found in diff entries")
+}
+
+func TestLocalOnlyNotFlaggedAsOrphan(t *testing.T) {
+	ctx := context.Background()
+
+	env := setupTestEnv(t)
+	writeFile(t, env.claudeDir, "CLAUDE.md", "# brand new")
+
+	// File exists locally but never synced — should be "local_only", not "orphaned"
+	entries, err := env.syncer.Diff(ctx)
+	if err != nil {
+		t.Fatalf("Diff failed: %v", err)
+	}
+
+	for _, e := range entries {
+		if e.Path == "CLAUDE.md" {
+			if e.Status != "local_only" {
+				t.Errorf("Unsynchronized local file should be 'local_only', got %q", e.Status)
+			}
+			return
+		}
+	}
+	t.Error("CLAUDE.md not found in diff entries")
+}
