@@ -669,6 +669,86 @@ func TestPullDetectsOrphans(t *testing.T) {
 	}
 }
 
+func TestPullPreservesLocalDeletion(t *testing.T) {
+	ctx := context.Background()
+
+	// Two devices share storage. A pushes a file; B pulls it.
+	envA := setupTestEnv(t)
+	writeFile(t, envA.claudeDir, "rules/keep-me.md", "# original")
+	if _, err := envA.syncer.Push(ctx); err != nil {
+		t.Fatalf("Push A failed: %v", err)
+	}
+
+	envB := setupTestEnv(t)
+	envB.syncer.storage = envA.store
+	if _, err := envB.syncer.Pull(ctx); err != nil {
+		t.Fatalf("Pull B failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(envB.claudeDir, "rules/keep-me.md")); err != nil {
+		t.Fatalf("file should exist on B after pull: %v", err)
+	}
+
+	// User on B deletes the file locally and runs sync (pull then push).
+	if err := os.Remove(filepath.Join(envB.claudeDir, "rules/keep-me.md")); err != nil {
+		t.Fatalf("local delete failed: %v", err)
+	}
+
+	pullRes, err := envB.syncer.Pull(ctx)
+	if err != nil {
+		t.Fatalf("Pull B (after delete) failed: %v", err)
+	}
+	if len(pullRes.Downloaded) != 0 {
+		t.Errorf("expected 0 downloads (local deletion should win), got %d: %v",
+			len(pullRes.Downloaded), pullRes.Downloaded)
+	}
+	if _, err := os.Stat(filepath.Join(envB.claudeDir, "rules/keep-me.md")); !os.IsNotExist(err) {
+		t.Fatal("locally-deleted file must not be re-downloaded by pull")
+	}
+
+	// Push should propagate the deletion to remote.
+	pushRes, err := envB.syncer.Push(ctx)
+	if err != nil {
+		t.Fatalf("Push B failed: %v", err)
+	}
+	if len(pushRes.Deleted) != 1 || pushRes.Deleted[0] != "rules/keep-me.md" {
+		t.Errorf("expected push to delete rules/keep-me.md, got: %v", pushRes.Deleted)
+	}
+
+	// Remote should be empty.
+	objs, _ := envA.store.List(ctx, "")
+	if len(objs) != 0 {
+		t.Errorf("expected remote empty after deletion sync, got %d objects", len(objs))
+	}
+}
+
+func TestPreviewPullClassifiesLocalDeletion(t *testing.T) {
+	ctx := context.Background()
+
+	envA := setupTestEnv(t)
+	writeFile(t, envA.claudeDir, "CLAUDE.md", "# v1")
+	if _, err := envA.syncer.Push(ctx); err != nil {
+		t.Fatalf("Push A failed: %v", err)
+	}
+
+	envB := setupTestEnv(t)
+	envB.syncer.storage = envA.store
+	if _, err := envB.syncer.Pull(ctx); err != nil {
+		t.Fatalf("Pull B failed: %v", err)
+	}
+	os.Remove(filepath.Join(envB.claudeDir, "CLAUDE.md"))
+
+	preview, err := envB.syncer.PreviewPull(ctx)
+	if err != nil {
+		t.Fatalf("PreviewPull failed: %v", err)
+	}
+	if len(preview.WouldDownload) != 0 {
+		t.Errorf("expected no WouldDownload entries for locally-deleted file, got %d", len(preview.WouldDownload))
+	}
+	if len(preview.WouldKeepDeleted) != 1 || preview.WouldKeepDeleted[0].Path != "CLAUDE.md" {
+		t.Errorf("expected CLAUDE.md in WouldKeepDeleted, got: %+v", preview.WouldKeepDeleted)
+	}
+}
+
 func TestPruneOrphansDeletesFiles(t *testing.T) {
 	ctx := context.Background()
 

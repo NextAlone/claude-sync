@@ -2207,7 +2207,7 @@ func showPullPreview(ctx context.Context, syncer *sync.Syncer) error {
 	}
 
 	// If nothing would happen
-	total := len(preview.WouldDownload) + len(preview.WouldOverwrite) + len(preview.WouldConflict)
+	total := len(preview.WouldDownload) + len(preview.WouldOverwrite) + len(preview.WouldConflict) + len(preview.WouldKeepDeleted)
 	if total == 0 {
 		fmt.Printf("%s✓%s Already up to date (dry run)\n", colorGreen, colorReset)
 		return nil
@@ -2259,6 +2259,15 @@ func showPullPreview(ctx context.Context, syncer *sync.Syncer) error {
 		fmt.Printf("Would report as orphaned - deleted upstream (%d files):\n", len(preview.OrphanedFiles))
 		for _, f := range preview.OrphanedFiles {
 			fmt.Printf("  %s✗%s %s (%s)\n", colorYellow, colorReset, f.Path, util.FormatSize(f.LocalSize))
+		}
+		fmt.Println()
+	}
+
+	// Show files deleted locally — pull will skip; push will delete remote
+	if len(preview.WouldKeepDeleted) > 0 {
+		fmt.Printf("Locally deleted - skip download, push will delete remote (%d files):\n", len(preview.WouldKeepDeleted))
+		for _, f := range preview.WouldKeepDeleted {
+			fmt.Printf("  %s-%s %s (%s)\n", colorYellow, colorReset, f.Path, util.FormatSize(f.RemoteSize))
 		}
 		fmt.Println()
 	}

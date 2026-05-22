@@ -309,6 +309,12 @@ func (s *Syncer) Pull(ctx context.Context) (*SyncResult, error) {
 		}
 
 		if !localExists {
+			if stateFile != nil {
+				// File was pulled/pushed before but is now missing locally — user deleted it.
+				// Skip re-download so a subsequent push propagates the deletion to remote.
+				// Local intent wins even if remote was updated after our last sync.
+				continue
+			}
 			shouldDownload = true
 		} else if stateFile != nil {
 			// Check if remote is newer than our last known state
@@ -613,12 +619,13 @@ type FilePreview struct {
 
 // PullPreview represents what would happen during a pull operation
 type PullPreview struct {
-	WouldDownload  []FilePreview // New remote files that would be downloaded
-	WouldOverwrite []FilePreview // Existing local files that would be replaced
-	WouldKeep      []FilePreview // Local files that would be kept (local newer)
-	WouldConflict  []FilePreview // Files that would create a conflict
-	LocalOnlyFiles []FilePreview // Files that exist only locally
-	OrphanedFiles  []FilePreview // Files pulled before, now deleted upstream
+	WouldDownload       []FilePreview // New remote files that would be downloaded
+	WouldOverwrite      []FilePreview // Existing local files that would be replaced
+	WouldKeep           []FilePreview // Local files that would be kept (local newer)
+	WouldConflict       []FilePreview // Files that would create a conflict
+	LocalOnlyFiles      []FilePreview // Files that exist only locally
+	OrphanedFiles       []FilePreview // Files pulled before, now deleted upstream
+	WouldKeepDeleted    []FilePreview // Files deleted locally — pull skips them so push can delete remote
 }
 
 // PreviewPull returns a preview of what would happen during a pull operation
@@ -672,6 +679,13 @@ func (s *Syncer) PreviewPull(ctx context.Context) (*PullPreview, error) {
 		}
 
 		if !localExists {
+			if stateFile != nil {
+				// File was synced before but is now missing locally — user deleted it.
+				// Pull will skip it; a subsequent push will propagate the deletion to remote.
+				fp.LocalOnly = false
+				preview.WouldKeepDeleted = append(preview.WouldKeepDeleted, fp)
+				continue
+			}
 			// New file from remote
 			fp.RemoteOnly = true
 			preview.WouldDownload = append(preview.WouldDownload, fp)
